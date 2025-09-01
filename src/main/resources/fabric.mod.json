@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "mercury",
+  "version": "${version}",
+  "name": "Mercury",
+  "description": "",
+  "authors": [],
+  "contact": {},
+  "license": "unlicense",
+  "icon": "assets/mercury/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "fabric-datagen": [
+      "xiaobai.client.MercuryDataGenerator"
+    ],
+    "client": [
+      "xiaobai.client.MercuryClient"
+    ],
+    "main": [
+      "xiaobai.Mercury"
+    ]
+  },
+  "mixins": [
+    "mercury.mixins.json",
+    {
+      "config": "mercury.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "fabric": "*",
+    "minecraft": "${minecraft_version}"
+  }
+}
