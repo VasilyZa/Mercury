@@ -4,7 +4,15 @@ on:
   push:
     tags:
       - 'v*'
+      - '*.*.*'
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag to release (e.g. v1.20.1) when manually dispatching'
+        required: false
+      target_commitish:
+        description: 'Commit SHA or branch to tag when manually dispatching (defaults to current commit)'
+        required: false
 
 jobs:
   build:
@@ -30,9 +38,11 @@ jobs:
         run: gradle --no-daemon clean build remapJar
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+          target_commitish: ${{ github.event_name == 'workflow_dispatch' && (inputs.target_commitish != '' && inputs.target_commitish || github.sha) || '' }}
           files: |
             build/libs/*.jar
           generate_release_notes: true
