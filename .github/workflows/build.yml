@@ -69,8 +69,12 @@ jobs:
       - name: Build with Gradle
         shell: bash
         run: |
-          ./gradlew --no-daemon clean build remapJar -Pmod_version="${{ steps.vars.outputs.version }}"
-
+          if [ -f gradle/wrapper/gradle-wrapper.jar ] && [ -f ./gradlew ]; then
+            ./gradlew --no-daemon clean build remapJar -Pmod_version="${{ steps.vars.outputs.version }}"
+          else
+            gradle --no-daemon clean build remapJar -Pmod_version="${{ steps.vars.outputs.version }}"
+          fi
+          
       - name: Rename artifact to Mercury-{version}-{commit}.jar
         id: rename
         shell: bash
