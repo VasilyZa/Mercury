@@ -61,6 +61,10 @@ jobs:
           echo "tag=${RAW_TAG}" >> "$GITHUB_OUTPUT"
           echo "commit_sha=${FULL_SHA}" >> "$GITHUB_OUTPUT"
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+      - name: Permission
+        shell: bash
+        run: |
+          chmod +x ./gradlew
 
       - name: Build with Gradle
         shell: bash
