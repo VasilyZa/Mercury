@@ -2,6 +2,7 @@ package xiaobai.config;
 
 import net.fabricmc.loader.api.FabricLoader;
 import xiaobai.memory.MemoryOptimizer;
+import xiaobai.memory.ShenandoahTuner;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -98,6 +99,42 @@ public final class MercuryConfig {
 		if (trimAllEventLoops != null) {
 			MemoryOptimizer.setNettyTrimAllEventLoops(Boolean.parseBoolean(trimAllEventLoops));
 		}
+
+		String includeDirect = p.getProperty("mercury.includeDirectInRatio");
+		if (includeDirect != null) {
+			MemoryOptimizer.setIncludeDirectInRatio(Boolean.parseBoolean(includeDirect));
+		}
+
+		String hysteresis = p.getProperty("mercury.hysteresisMargin");
+		if (hysteresis != null) {
+			try {
+				MemoryOptimizer.setHysteresisMargin(Double.parseDouble(hysteresis));
+			} catch (NumberFormatException ignored) {}
+		}
+
+		// Optional Shenandoah tuning (best-effort)
+		if (ShenandoahTuner.isShenandoahActive()) {
+			String egc = p.getProperty("mercury.shenandoah.explicitGcConcurrent");
+			if (egc != null) ShenandoahTuner.setExplicitGcInvokesConcurrent(Boolean.parseBoolean(egc));
+			String uncommit = p.getProperty("mercury.shenandoah.enableUncommit");
+			if (uncommit != null) ShenandoahTuner.setUncommitEnabled(Boolean.parseBoolean(uncommit));
+			String uncommitDelay = p.getProperty("mercury.shenandoah.uncommitDelayMs");
+			if (uncommitDelay != null) {
+				try { ShenandoahTuner.setUncommitDelayMs(Long.parseLong(uncommitDelay)); } catch (NumberFormatException ignored) {}
+			}
+			String heur = p.getProperty("mercury.shenandoah.heuristics");
+			if (heur != null) ShenandoahTuner.setHeuristics(heur);
+			String thr = p.getProperty("mercury.shenandoah.garbageThreshold");
+			if (thr != null) {
+				try { ShenandoahTuner.setGarbageThreshold(Integer.parseInt(thr)); } catch (NumberFormatException ignored) {}
+			}
+			String gInt = p.getProperty("mercury.shenandoah.guaranteedGcIntervalMs");
+			if (gInt != null) {
+				try { ShenandoahTuner.setGuaranteedGcIntervalMs(Long.parseLong(gInt)); } catch (NumberFormatException ignored) {}
+			}
+		}
+
+		// Auto-degrade is disabled; ignore related config keys if present.
 	}
 
 	private static Properties capture() {
@@ -111,6 +148,26 @@ public final class MercuryConfig {
 		p.setProperty("mercury.enableAdaptiveTrendGuard", Boolean.toString(MemoryOptimizer.isEnableAdaptiveTrendGuard()));
 		p.setProperty("mercury.trendGuardMinIncreaseMb", Long.toString(MemoryOptimizer.getTrendGuardMinIncreaseMb()));
 		p.setProperty("mercury.nettyTrimAllEventLoops", Boolean.toString(MemoryOptimizer.isNettyTrimAllEventLoops()));
+		p.setProperty("mercury.includeDirectInRatio", Boolean.toString(MemoryOptimizer.isIncludeDirectInRatio()));
+		p.setProperty("mercury.hysteresisMargin", Double.toString(MemoryOptimizer.getHysteresisMargin()));
+
+		// Persist Shenandoah tuning snapshot (best-effort)
+		p.setProperty("mercury.shenandoah.gc", ShenandoahTuner.buildSummary());
+		if (ShenandoahTuner.isShenandoahActive()) {
+			p.setProperty("mercury.shenandoah.explicitGcConcurrent", Boolean.toString(ShenandoahTuner.isExplicitGcInvokesConcurrent()));
+			Boolean uncommit = ShenandoahTuner.isUncommitEnabled();
+			if (uncommit != null) p.setProperty("mercury.shenandoah.enableUncommit", Boolean.toString(uncommit));
+			Long d = ShenandoahTuner.getUncommitDelayMs();
+			if (d != null) p.setProperty("mercury.shenandoah.uncommitDelayMs", Long.toString(d));
+			String heur = ShenandoahTuner.getHeuristics();
+			if (heur != null) p.setProperty("mercury.shenandoah.heuristics", heur);
+			Integer thr = ShenandoahTuner.getGarbageThreshold();
+			if (thr != null) p.setProperty("mercury.shenandoah.garbageThreshold", Integer.toString(thr));
+			Long gInt = ShenandoahTuner.getGuaranteedGcIntervalMs();
+			if (gInt != null) p.setProperty("mercury.shenandoah.guaranteedGcIntervalMs", Long.toString(gInt));
+		}
+
+		// Auto-degrade is disabled; do not persist related keys.
 		return p;
 	}
 } 

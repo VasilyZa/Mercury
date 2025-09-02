@@ -3,6 +3,7 @@ package xiaobai.command;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.BoolArgumentType;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.LongArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
@@ -11,6 +12,7 @@ import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.text.Text;
 import xiaobai.memory.MemoryOptimizer;
+import xiaobai.memory.ShenandoahTuner;
 
 public final class MercuryCommand implements CommandRegistrationCallback {
 	@Override
@@ -52,7 +54,40 @@ public final class MercuryCommand implements CommandRegistrationCallback {
 						.executes(ctx -> setTrendIncreaseMb(ctx.getSource(), LongArgumentType.getLong(ctx, "value")))))
 				.then(CommandManager.literal("nettyTrimAllEventLoops")
 					.then(CommandManager.literal("on").executes(ctx -> setTrimAllEventLoops(ctx.getSource(), true)))
-					.then(CommandManager.literal("off").executes(ctx -> setTrimAllEventLoops(ctx.getSource(), false)))))
+					.then(CommandManager.literal("off").executes(ctx -> setTrimAllEventLoops(ctx.getSource(), false))))
+				.then(CommandManager.literal("includeDirectInRatio")
+					.then(CommandManager.literal("on").executes(ctx -> setIncludeDirect(ctx.getSource(), true)))
+					.then(CommandManager.literal("off").executes(ctx -> setIncludeDirect(ctx.getSource(), false))))
+				.then(CommandManager.literal("hysteresisMargin")
+					.then(CommandManager.argument("value", DoubleArgumentType.doubleArg(0.0, 0.5))
+						.executes(ctx -> setHysteresis(ctx.getSource(), DoubleArgumentType.getDouble(ctx, "value")))))
+				.then(CommandManager.literal("autoDegrade")
+					.executes(ctx -> autoDegradeDisabled(ctx.getSource()))))
+			.then(CommandManager.literal("shenandoah")
+				.executes(ctx -> {
+					ctx.getSource().sendFeedback(() -> Text.literal("GC: " + ShenandoahTuner.buildSummary()), false);
+					return 1;
+				})
+				.then(CommandManager.literal("explicitGcConcurrent")
+					.then(CommandManager.literal("on").executes(ctx -> setShenExplicitConcurrent(ctx.getSource(), true)))
+					.then(CommandManager.literal("off").executes(ctx -> setShenExplicitConcurrent(ctx.getSource(), false))))
+				.then(CommandManager.literal("enableUncommit")
+					.then(CommandManager.literal("on").executes(ctx -> setShenUncommit(ctx.getSource(), true)))
+					.then(CommandManager.literal("off").executes(ctx -> setShenUncommit(ctx.getSource(), false))))
+				.then(CommandManager.literal("uncommitDelayMs")
+					.then(CommandManager.argument("value", LongArgumentType.longArg(0))
+						.executes(ctx -> setShenUncommitDelay(ctx.getSource(), LongArgumentType.getLong(ctx, "value")))))
+				.then(CommandManager.literal("heuristics")
+					.then(CommandManager.literal("adaptive").executes(ctx -> setShenHeuristics(ctx.getSource(), "adaptive")))
+					.then(CommandManager.literal("static").executes(ctx -> setShenHeuristics(ctx.getSource(), "static")))
+					.then(CommandManager.literal("compact").executes(ctx -> setShenHeuristics(ctx.getSource(), "compact")))
+					.then(CommandManager.literal("aggressive").executes(ctx -> setShenHeuristics(ctx.getSource(), "aggressive"))))
+				.then(CommandManager.literal("garbageThreshold")
+					.then(CommandManager.argument("percent", IntegerArgumentType.integer(0, 100))
+						.executes(ctx -> setShenGarbageThreshold(ctx.getSource(), IntegerArgumentType.getInteger(ctx, "percent")))))
+				.then(CommandManager.literal("guaranteedGcIntervalMs")
+					.then(CommandManager.argument("value", LongArgumentType.longArg(0))
+						.executes(ctx -> setShenGuaranteedInterval(ctx.getSource(), LongArgumentType.getLong(ctx, "value"))))))
 			.then(CommandManager.literal("save").executes(ctx -> {
 				xiaobai.config.MercuryConfig.save();
 				ctx.getSource().sendFeedback(() -> Text.literal("Mercury settings saved to config"), true);
@@ -124,6 +159,60 @@ public final class MercuryCommand implements CommandRegistrationCallback {
 	private int setTrimAllEventLoops(ServerCommandSource source, boolean enable) {
 		MemoryOptimizer.setNettyTrimAllEventLoops(enable);
 		source.sendFeedback(() -> Text.literal("Mercury nettyTrimAllEventLoops=" + enable + ", knownEventLoops=" + MemoryOptimizer.getKnownEventLoopsCount()), true);
+		return 1;
+	}
+
+	private int setIncludeDirect(ServerCommandSource source, boolean enable) {
+		MemoryOptimizer.setIncludeDirectInRatio(enable);
+		source.sendFeedback(() -> Text.literal("Mercury includeDirectInRatio=" + enable), true);
+		return 1;
+	}
+
+	private int setHysteresis(ServerCommandSource source, double value) {
+		MemoryOptimizer.setHysteresisMargin(value);
+		source.sendFeedback(() -> Text.literal("Mercury hysteresisMargin=" + String.format("%.2f", value)), true);
+		return 1;
+	}
+
+	private int autoDegradeDisabled(ServerCommandSource source) {
+		source.sendFeedback(() -> Text.literal("Auto-degrade is disabled in this build."), false);
+		return 1;
+	}
+
+	// ===== Shenandoah commands =====
+	private int setShenExplicitConcurrent(ServerCommandSource source, boolean enable) {
+		boolean ok = ShenandoahTuner.setExplicitGcInvokesConcurrent(enable);
+		source.sendFeedback(() -> Text.literal("Shenandoah ExplicitGCInvokesConcurrent=" + enable + (ok ? " (applied)" : " (unsupported)")), true);
+		return 1;
+	}
+
+	private int setShenUncommit(ServerCommandSource source, boolean enable) {
+		boolean ok = ShenandoahTuner.setUncommitEnabled(enable);
+		source.sendFeedback(() -> Text.literal("ShenandoahUncommit=" + enable + (ok ? " (applied)" : " (unsupported)")), true);
+		return 1;
+	}
+
+	private int setShenUncommitDelay(ServerCommandSource source, long ms) {
+		boolean ok = ShenandoahTuner.setUncommitDelayMs(ms);
+		source.sendFeedback(() -> Text.literal("ShenandoahUncommitDelay=" + ms + (ok ? " (applied)" : " (unsupported)")), true);
+		return 1;
+	}
+
+	private int setShenHeuristics(ServerCommandSource source, String mode) {
+		boolean ok = ShenandoahTuner.setHeuristics(mode);
+		source.sendFeedback(() -> Text.literal("ShenandoahGCHeuristics=" + mode + (ok ? " (applied)" : " (unsupported)")), true);
+		return 1;
+	}
+
+	private int setShenGarbageThreshold(ServerCommandSource source, int percent) {
+		boolean ok = ShenandoahTuner.setGarbageThreshold(percent);
+		source.sendFeedback(() -> Text.literal("ShenandoahGarbageThreshold=" + percent + (ok ? " (applied)" : " (unsupported)")), true);
+		return 1;
+	}
+
+	private int setShenGuaranteedInterval(ServerCommandSource source, long ms) {
+		boolean ok = ShenandoahTuner.setGuaranteedGcIntervalMs(ms);
+		source.sendFeedback(() -> Text.literal("ShenandoahGuaranteedGCInterval=" + ms + (ok ? " (applied)" : " (unsupported)")), true);
 		return 1;
 	}
 } 

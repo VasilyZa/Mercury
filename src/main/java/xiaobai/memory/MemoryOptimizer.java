@@ -10,6 +10,7 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.resource.ResourceManagerHelper;
 import net.fabricmc.fabric.api.resource.SimpleSynchronousResourceReloadListener;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerWorldEvents;
 import net.minecraft.resource.ResourceManager;
 import net.minecraft.resource.ResourceType;
 import net.minecraft.server.MinecraftServer;
@@ -19,6 +20,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.imageio.ImageIO;
+import java.lang.management.BufferPoolMXBean;
+import java.lang.management.ManagementFactory;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.time.Duration;
@@ -70,6 +73,22 @@ public final class MemoryOptimizer {
 	private static volatile boolean ENABLE_ADAPTIVE_TREND_GUARD = true;
 	private static volatile long TREND_GUARD_MIN_INCREASE_BYTES = 16L * 1024L * 1024L; // 16MB
 	private static volatile boolean NETTY_TRIM_ALL_EVENT_LOOPS = true;
+	private static volatile boolean INCLUDE_DIRECT_IN_RATIO = true;
+	private static volatile double HYSTERESIS_MARGIN = 0.04;
+	private static final AtomicBoolean HYSTERESIS_GATE_RAISED = new AtomicBoolean(false);
+
+	// Auto-degrade settings
+	private static volatile boolean AUTO_DEGRADE_ENABLED = false;
+	private static volatile double AUTO_DEGRADE_HIGH_RATIO = 0.88;
+	private static volatile double AUTO_DEGRADE_LOW_RATIO = 0.80;
+	private static volatile long AUTO_DEGRADE_MIN_DURATION_SECONDS = 10L;
+	private static volatile int AUTO_DEGRADE_VIEW_DISTANCE_DELTA = 1;
+	private static volatile int AUTO_DEGRADE_SIM_DISTANCE_DELTA = 1;
+	private static volatile boolean DEGRADE_ACTIVE = false;
+	private static final AtomicLong LAST_HIGH_PRESSURE_NANOS = new AtomicLong(0L);
+	private static final AtomicLong LAST_RELIEF_NANOS = new AtomicLong(0L);
+	private static volatile int ORIG_VIEW_DISTANCE = -1;
+	private static volatile int ORIG_SIM_DISTANCE = -1;
 
 	private MemoryOptimizer() {}
 
@@ -78,6 +97,7 @@ public final class MemoryOptimizer {
 
 		configureFromSystemProperties();
 		configureNettyAllocatorProperties();
+		ShenandoahTuner.applyStartupTuningFromSystemProperties(DEBUG_LOGS);
 
 		// Server lifecycle hooks for safe trim points
 		ServerLifecycleEvents.SERVER_STARTED.register(server -> {
@@ -107,6 +127,12 @@ public final class MemoryOptimizer {
 			}
 		});
 
+		// World unload → free old references and trim
+		ServerWorldEvents.UNLOAD.register((server, world) -> {
+			safeTrim("world_unload");
+			scheduleDelayedTrim(Duration.ofMillis(200));
+		});
+
 		// Periodic server tick trimming under pressure + idle detection + delayed trims
 		ServerTickEvents.END_SERVER_TICK.register(server -> {
 			maybeTrimMemory("server_tick");
@@ -132,6 +158,11 @@ public final class MemoryOptimizer {
 					}
 				}
 			} catch (Throwable ignored) {}
+
+			// Auto-degrade is disabled in this build.
+			DEGRADE_ACTIVE = false;
+			LAST_HIGH_PRESSURE_NANOS.set(0L);
+			LAST_RELIEF_NANOS.set(0L);
 
 			// Delayed trim check
 			long scheduledAt = SCHEDULED_TRIM_AT_NANOS.get();
@@ -202,6 +233,9 @@ public final class MemoryOptimizer {
 		long trendMb = getLongProperty("mercury.trendGuardMinIncreaseMb", TREND_GUARD_MIN_INCREASE_BYTES / (1024L * 1024L), 1, 8192);
 		TREND_GUARD_MIN_INCREASE_BYTES = trendMb * 1024L * 1024L;
 		NETTY_TRIM_ALL_EVENT_LOOPS = getBooleanProperty("mercury.nettyTrimAllEventLoops", NETTY_TRIM_ALL_EVENT_LOOPS);
+		INCLUDE_DIRECT_IN_RATIO = getBooleanProperty("mercury.includeDirectInRatio", INCLUDE_DIRECT_IN_RATIO);
+		HYSTERESIS_MARGIN = getDoubleProperty("mercury.hysteresisMargin", HYSTERESIS_MARGIN, 0.0, 0.5);
+		// Auto-degrade is disabled in this build; ignore related system properties.
 	}
 
 	private static boolean getBooleanProperty(String key, boolean def) {
@@ -266,11 +300,36 @@ public final class MemoryOptimizer {
 		if (now - last < MIN_TRIM_INTERVAL.toNanos()) return;
 
 		Runtime rt = Runtime.getRuntime();
-		long used = rt.totalMemory() - rt.freeMemory();
-		long max = rt.maxMemory();
+		long heapUsed = rt.totalMemory() - rt.freeMemory();
+		long heapMax = rt.maxMemory();
+
+		long directUsed = 0L;
+		long mappedUsed = 0L;
+		try {
+			long[] dm = getDirectAndMappedMemoryUsed();
+			directUsed = dm[0];
+			mappedUsed = dm[1];
+		} catch (Throwable ignored) {}
+
+		long used = heapUsed;
+		long max = heapMax;
+
+		if (INCLUDE_DIRECT_IN_RATIO) {
+			used += directUsed;
+			long directMax = estimateMaxDirectMemory();
+			if (directMax > 0L) {
+				max += directMax;
+			}
+		}
+
 		if (max <= 0) return;
 
 		double ratio = (double) used / (double) max;
+
+		// Hysteresis gate reset when fully relieved
+		if (ratio < LOW_MEMORY_RATIO - HYSTERESIS_MARGIN) {
+			HYSTERESIS_GATE_RAISED.set(false);
+		}
 
 		// Adaptive trend guard: only trigger when memory is growing fast enough
 		if (ENABLE_ADAPTIVE_TREND_GUARD) {
@@ -284,18 +343,20 @@ public final class MemoryOptimizer {
 			}
 			long increase = used - baseUsed;
 			if (ratio >= LOW_MEMORY_RATIO && increase >= TREND_GUARD_MIN_INCREASE_BYTES) {
+				if (!HYSTERESIS_GATE_RAISED.compareAndSet(false, true)) return;
 				if (!LAST_TRIM_NANOS.compareAndSet(last, now)) return;
-				if (DEBUG_LOGS) LOGGER.debug("Mercury trim triggered (reason={}, used={}MB, max={}MB, ratio={}, increase={}MB)",
-					reason, toMb(used), toMb(max), String.format("%.2f", ratio), toMb(increase));
+				if (DEBUG_LOGS) LOGGER.debug("Mercury trim triggered (reason={}, used={}MB, max={}MB, ratio={}, increase={}MB, directUsed={}MB, mappedUsed={}MB)",
+					reason, toMb(used), toMb(max), String.format("%.2f", ratio), toMb(increase), toMb(directUsed), toMb(mappedUsed));
 				safeTrim(reason + "_low_memory:" + String.format("%.2f", ratio));
 			}
 			return;
 		}
 
 		if (ratio >= LOW_MEMORY_RATIO) {
+			if (!HYSTERESIS_GATE_RAISED.compareAndSet(false, true)) return;
 			if (!LAST_TRIM_NANOS.compareAndSet(last, now)) return;
-			if (DEBUG_LOGS) LOGGER.debug("Mercury trim triggered (reason={}, used={}MB, max={}MB, ratio={})",
-				reason, toMb(used), toMb(max), String.format("%.2f", ratio));
+			if (DEBUG_LOGS) LOGGER.debug("Mercury trim triggered (reason={}, used={}MB, max={}MB, ratio={}, directUsed={}MB, mappedUsed={}MB)",
+				reason, toMb(used), toMb(max), String.format("%.2f", ratio), toMb(directUsed), toMb(mappedUsed));
 			safeTrim(reason + "_low_memory:" + String.format("%.2f", ratio));
 		}
 	}
@@ -319,9 +380,13 @@ public final class MemoryOptimizer {
 		long lastGc = LAST_GC_NANOS.get();
 		if (now - lastGc >= MIN_GC_INTERVAL.toNanos() && LAST_GC_NANOS.compareAndSet(lastGc, now)) {
 			try {
+				// If Shenandoah is active, request concurrent explicit GC to avoid long STWs
+				if (ShenandoahTuner.isShenandoahActive() && !ShenandoahTuner.isExplicitGcInvokesConcurrent()) {
+					ShenandoahTuner.setExplicitGcInvokesConcurrent(true);
+				}
 				System.gc();
 				GC_COUNT.incrementAndGet();
-				if (DEBUG_LOGS) LOGGER.debug("System.gc() invoked by Mercury (reason: {})", reason);
+				if (DEBUG_LOGS) LOGGER.debug("System.gc() invoked by Mercury (reason: {}, gc={})", reason, ShenandoahTuner.buildSummary());
 			} catch (Throwable t) {
 				if (DEBUG_LOGS) LOGGER.debug("System.gc() failed ({}): {}", reason, t.toString());
 			}
@@ -398,6 +463,40 @@ public final class MemoryOptimizer {
 		NETTY_TRIM_ALL_EVENT_LOOPS = enable;
 	}
 
+	public static void setIncludeDirectInRatio(boolean include) {
+		INCLUDE_DIRECT_IN_RATIO = include;
+	}
+
+	public static void setHysteresisMargin(double margin) {
+		if (margin >= 0.0 && margin <= 0.5) {
+			HYSTERESIS_MARGIN = margin;
+		}
+	}
+
+	public static void setAutoDegradeEnabled(boolean enable) {
+		AUTO_DEGRADE_ENABLED = false;
+	}
+
+	public static void setAutoDegradeHighRatio(double ratio) {
+		// disabled
+	}
+
+	public static void setAutoDegradeLowRatio(double ratio) {
+		// disabled
+	}
+
+	public static void setAutoDegradeMinDurationSeconds(long seconds) {
+		// disabled
+	}
+
+	public static void setAutoDegradeViewDistanceDelta(int delta) {
+		// disabled
+	}
+
+	public static void setAutoDegradeSimulationDistanceDelta(int delta) {
+		// disabled
+	}
+
 	public static String getStatus() {
 		Runtime rt = Runtime.getRuntime();
 		long used = rt.totalMemory() - rt.freeMemory();
@@ -423,21 +522,49 @@ public final class MemoryOptimizer {
 			}
 		} catch (Throwable ignored) {}
 
+		long directUsed = 0L;
+		long mappedUsed = 0L;
+		long directMax = -1L;
+		try {
+			long[] dm = getDirectAndMappedMemoryUsed();
+			directUsed = dm[0];
+			mappedUsed = dm[1];
+			directMax = estimateMaxDirectMemory();
+		} catch (Throwable ignored) {}
+
+		long totalUsedCombined = used + (INCLUDE_DIRECT_IN_RATIO ? directUsed : 0L);
+		long totalMaxCombined = max + ((INCLUDE_DIRECT_IN_RATIO && directMax > 0L) ? directMax : 0L);
+		double totalRatio = totalMaxCombined > 0 ? (double) totalUsedCombined / (double) totalMaxCombined : ratio;
+
 		return String.format(
-			"enableExplicitGc=%s, debugLogs=%s, ratioThreshold=%.2f, trimIntervalMs=%d, gcIntervalMs=%d, idleSeconds=%d, adaptiveTrend=%s, trendMinIncreaseMb=%d, nettyTrimAllEventLoops=%s, heapUsed=%dMB, heapTotal=%dMB, heapMax=%dMB, used/Max=%.2f, trims=%d, gcs=%d, lastTrimReason=%s, lastTrimDurationMs=%.2f, netty(heapArenas=%d,directArenas=%d,activeHeapMb=%d,activeDirectMb=%d), eventLoops=%d",
+			"enableExplicitGc=%s, debugLogs=%s, ratioThreshold=%.2f, hysteresisMargin=%.2f, includeDirectInRatio=%s, trimIntervalMs=%d, gcIntervalMs=%d, idleSeconds=%d, adaptiveTrend=%s, trendMinIncreaseMb=%d, nettyTrimAllEventLoops=%s, autoDegrade(enabled=%s,high=%.2f,low=%.2f,durationSec=%d,deltaVD=%d,deltaSD=%d,active=%s), gc={%s}, heapUsed=%dMB, heapTotal=%dMB, heapMax=%dMB, used/Max=%.2f, totalUsed/Max=%.2f, directUsed=%dMB, mappedUsed=%dMB, directMaxMb=%d, trims=%d, gcs=%d, lastTrimReason=%s, lastTrimDurationMs=%.2f, netty(heapArenas=%d,directArenas=%d,activeHeapMb=%d,activeDirectMb=%d), eventLoops=%d",
 			Boolean.toString(ENABLE_EXPLICIT_GC),
 			Boolean.toString(DEBUG_LOGS),
 			LOW_MEMORY_RATIO,
+			HYSTERESIS_MARGIN,
+			Boolean.toString(INCLUDE_DIRECT_IN_RATIO),
 			MIN_TRIM_INTERVAL.toMillis(),
 			MIN_GC_INTERVAL.toMillis(),
 			TRIM_ON_IDLE_SECONDS,
 			Boolean.toString(ENABLE_ADAPTIVE_TREND_GUARD),
 			TREND_GUARD_MIN_INCREASE_BYTES / (1024L * 1024L),
 			Boolean.toString(NETTY_TRIM_ALL_EVENT_LOOPS),
+			Boolean.toString(AUTO_DEGRADE_ENABLED),
+			AUTO_DEGRADE_HIGH_RATIO,
+			AUTO_DEGRADE_LOW_RATIO,
+			AUTO_DEGRADE_MIN_DURATION_SECONDS,
+			AUTO_DEGRADE_VIEW_DISTANCE_DELTA,
+			AUTO_DEGRADE_SIM_DISTANCE_DELTA,
+			Boolean.toString(DEGRADE_ACTIVE),
+			ShenandoahTuner.buildSummary(),
 			toMb(used),
 			toMb(total),
 			toMb(max),
 			ratio,
+			totalRatio,
+			toMb(directUsed),
+			toMb(mappedUsed),
+			directMax > 0 ? toMb(directMax) : -1,
 			TRIM_COUNT.get(),
 			GC_COUNT.get(),
 			LAST_TRIM_REASON,
@@ -492,9 +619,13 @@ public final class MemoryOptimizer {
 	}
 
 	public static void trimNow(boolean withGc, String reason) {
+		long start = System.nanoTime();
 		try {
 			trimNettyCaches();
 		} catch (Throwable ignored) {}
+		LAST_TRIM_REASON = reason != null ? reason : "command";
+		TRIM_COUNT.incrementAndGet();
+		LAST_TRIM_DURATION_NANOS.set(System.nanoTime() - start);
 		if (withGc) {
 			try {
 				System.gc();
@@ -548,5 +679,70 @@ public final class MemoryOptimizer {
 		} catch (Throwable t) {
 			if (DEBUG_LOGS) LOGGER.debug("Reflect EventLoopGroup failed: {}", t.toString());
 		}
+	}
+
+	private static long[] getDirectAndMappedMemoryUsed() {
+		long direct = 0L;
+		long mapped = 0L;
+		try {
+			for (BufferPoolMXBean pool : ManagementFactory.getPlatformMXBeans(BufferPoolMXBean.class)) {
+				String name = pool.getName();
+				if ("direct".equalsIgnoreCase(name)) {
+					direct = pool.getMemoryUsed();
+				} else if ("mapped".equalsIgnoreCase(name)) {
+					mapped = pool.getMemoryUsed();
+				}
+			}
+		} catch (Throwable ignored) {}
+		return new long[] { direct, mapped };
+	}
+
+	private static long estimateMaxDirectMemory() {
+		try {
+			Class<?> vm = Class.forName("sun.misc.VM");
+			Method m = vm.getDeclaredMethod("maxDirectMemory");
+			m.setAccessible(true);
+			Object v = m.invoke(null);
+			if (v instanceof Long) return (Long) v;
+		} catch (Throwable ignored) {}
+		try {
+			Class<?> vm = Class.forName("jdk.internal.misc.VM");
+			Method m = vm.getDeclaredMethod("maxDirectMemory");
+			m.setAccessible(true);
+			Object v = m.invoke(null);
+			if (v instanceof Long) return (Long) v;
+		} catch (Throwable ignored) {}
+		return -1L;
+	}
+
+	public static boolean isIncludeDirectInRatio() {
+		return INCLUDE_DIRECT_IN_RATIO;
+	}
+
+	public static double getHysteresisMargin() {
+		return HYSTERESIS_MARGIN;
+	}
+
+	public static boolean isAutoDegradeEnabled() { return AUTO_DEGRADE_ENABLED; }
+	public static double getAutoDegradeHighRatio() { return AUTO_DEGRADE_HIGH_RATIO; }
+	public static double getAutoDegradeLowRatio() { return AUTO_DEGRADE_LOW_RATIO; }
+	public static long getAutoDegradeMinDurationSeconds() { return AUTO_DEGRADE_MIN_DURATION_SECONDS; }
+	public static int getAutoDegradeViewDistanceDelta() { return AUTO_DEGRADE_VIEW_DISTANCE_DELTA; }
+	public static int getAutoDegradeSimulationDistanceDelta() { return AUTO_DEGRADE_SIM_DISTANCE_DELTA; }
+
+	private static double currentTotalMemoryPressureRatio() {
+		Runtime rt = Runtime.getRuntime();
+		long heapUsed = rt.totalMemory() - rt.freeMemory();
+		long heapMax = rt.maxMemory();
+		long used = heapUsed;
+		long max = heapMax;
+		if (INCLUDE_DIRECT_IN_RATIO) {
+			long[] dm = getDirectAndMappedMemoryUsed();
+			used += dm[0];
+			long directMax = estimateMaxDirectMemory();
+			if (directMax > 0L) max += directMax;
+		}
+		if (max <= 0L) return 0.0;
+		return (double) used / (double) max;
 	}
 } 
